@@ -5,20 +5,23 @@ import (
 	"github.com/joancema/examen-gimnasio/internal/storage"
 )
 
-// TAREA (CP2): Implemente InscripcionService con las 5 reglas de negocio.
+// Reglas del cálculo de total (pantalla 02: "Desde 5 unidades: 10% de descuento").
+const (
+	umbralDescuento = 5    // a partir de esta cantidad de cupos aplica el descuento
+	factorDescuento = 0.90 // 10% de descuento = pagar el 90%
+)
+
+// InscripcionService contiene las 5 reglas de negocio de la inscripción.
 //
-// Las reglas están A LA VISTA en las pantallas (carpeta pantallas/) y los
-// tests de acceptance/reglas_test.go las verifican una por una. Devuelva los
-// errores de dominio de errores.go: los tests los comprueban con errors.Is.
-//
-// Reglas:
-//   - NO cambie el nombre del tipo, del constructor ni las firmas de los métodos.
-//   - Observe que el service recibe TRES repositories: necesita consultar
-//     Clase y Cliente para validar, y actualizar Clase al retirar.
+// Recibe TRES repositorios porque una inscripción cruza tres entidades:
+// consulta Clase y Cliente para validar las referencias (R1), lee el stock
+// de la Clase (R2) y lo modifica al crear y al retirar (R5). Depende de las
+// INTERFACES, no de las implementaciones GORM: por eso reglas_test.go le
+// inyecta los repositorios en memoria.
 type InscripcionService struct {
-	inscripciones   storage.InscripcionRepository
-	clases storage.ClaseRepository
-	clientes     storage.ClienteRepository
+	inscripciones storage.InscripcionRepository
+	clases        storage.ClaseRepository
+	clientes      storage.ClienteRepository
 }
 
 func NuevaInscripcionService(
@@ -27,37 +30,93 @@ func NuevaInscripcionService(
 	clientes storage.ClienteRepository,
 ) *InscripcionService {
 	return &InscripcionService{
-		inscripciones:   inscripciones,
-		clases: clases,
-		clientes:     clientes,
+		inscripciones: inscripciones,
+		clases:        clases,
+		clientes:      clientes,
 	}
 }
 
-// Crear registra un nuevo inscripcion aplicando R1, R2 y R3.
-// TODO (R1): la clase debe existir y estar activa; el cliente debe existir.
-// TODO (R2): la cantidad no puede superar el stock disponible de la clase.
-// TODO (R3): calcule el total (observe en las pantallas cuándo aplica descuento).
-// TODO: al crear, el stock de la clase se descuenta (mire la pantalla 01
-// antes y después de crear una inscripcion; R5 es la operación inversa).
+// Crear registra una inscripción nueva aplicando R1, R2, R3 y el lado "crear"
+// de R5. El orden importa: primero se valida, y solo si todo pasa se toca el
+// stock y se persiste.
 func (s *InscripcionService) Crear(a *models.Inscripcion) error {
-	// TODO: implementar.
-	return ErrNoImplementado
+	// R1 — la clase debe existir Y estar activa.
+	clase, ok := s.clases.ObtenerPorID(a.ClaseID)
+	if !ok || !clase.Activo {
+		return ErrReferenciaInvalida
+	}
+
+	// R1 — el cliente debe existir.
+	if _, ok := s.clientes.ObtenerPorID(a.ClienteID); !ok {
+		return ErrReferenciaInvalida
+	}
+
+	// R2 — no se puede inscribir más cupos de los que hay en stock.
+	if a.Cantidad > clase.Stock {
+		return ErrStockInsuficiente
+	}
+
+	// R3 — total = cantidad x precio, con descuento desde 5 unidades.
+	a.Total = calcularTotal(a.Cantidad, clase.PrecioUnitario)
+
+	// Una inscripción recién creada siempre nace PENDIENTE (pantalla 03).
+	a.Estado = models.EstadoPendiente
+
+	// R5 (lado crear) — reservar los cupos: el stock baja por la cantidad.
+	clase.Stock -= a.Cantidad
+	if err := s.clases.Actualizar(&clase); err != nil {
+		return err
+	}
+
+	// Persistir la inscripción ya validada y con su total y estado.
+	return s.inscripciones.Crear(a)
 }
 
 func (s *InscripcionService) ObtenerPorID(id uint) (models.Inscripcion, error) {
-	// TODO: implementar.
-	return models.Inscripcion{}, ErrNoImplementado
+	a, ok := s.inscripciones.ObtenerPorID(id)
+	if !ok {
+		return models.Inscripcion{}, ErrNoEncontrado
+	}
+	return a, nil
 }
 
 func (s *InscripcionService) Listar() ([]models.Inscripcion, error) {
-	// TODO: implementar.
-	return nil, ErrNoImplementado
+	return s.inscripciones.Listar()
 }
 
-// Retirar cancela una inscripcion aplicando R4 y R5.
-// TODO (R4): solo se puede retirar una inscripcion en estado PENDIENTE.
-// TODO (R5): al retirar, la cantidad se repone al stock de la clase.
+// Retirar cancela una inscripción aplicando R4 y el lado "retirar" de R5.
 func (s *InscripcionService) Retirar(id uint) error {
-	// TODO: implementar.
-	return ErrNoImplementado
+	// La inscripción debe existir (esto es lo que el handler mapea a 404).
+	a, ok := s.inscripciones.ObtenerPorID(id)
+	if !ok {
+		return ErrNoEncontrado
+	}
+
+	// R4 — solo se retira lo que está PENDIENTE. Una ASISTIDA o una ya
+	// RETIRADA no se puede volver a retirar (pantalla 03: el botón Retirar
+	// solo está activo en la fila PENDIENTE).
+	if a.Estado != models.EstadoPendiente {
+		return ErrEstadoInvalido
+	}
+
+	// R5 (lado retirar) — devolver los cupos reservados al stock de la clase.
+	if clase, ok := s.clases.ObtenerPorID(a.ClaseID); ok {
+		clase.Stock += a.Cantidad
+		if err := s.clases.Actualizar(&clase); err != nil {
+			return err
+		}
+	}
+
+	// La inscripción queda RETIRADA.
+	a.Estado = models.EstadoRetirada
+	return s.inscripciones.Actualizar(&a)
+}
+
+// calcularTotal aplica R3: precio total con 10% de descuento desde 5 unidades.
+func calcularTotal(cantidad uint, precioUnitario float64) float64 {
+	total := float64(cantidad) * precioUnitario
+	if cantidad >= umbralDescuento {
+		total *= factorDescuento
+	}
+	return total
 }
