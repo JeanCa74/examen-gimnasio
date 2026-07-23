@@ -1,0 +1,7 @@
+Aquí van las 3 pantallas de la temática GIMNASIO:
+
+  01-listado.png  -> Listado de clases (catálogo)
+  02-crear.png    -> Formulario de creación de una inscripcion
+  03-detalle.png  -> Listado/detalle de inscripciones
+
+CARPETA BLOQUEADA — NO MODIFICAR
